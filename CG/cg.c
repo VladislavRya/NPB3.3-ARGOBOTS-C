@@ -26,9 +26,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include "globals.h"
 #include "randdp.h"
@@ -39,6 +36,79 @@
 
 
 //---------------------------------------------------------------------
+/* argobots helpers. May be moved to argobots after review */
+typedef struct {
+  ABT_xstream *xstreams;
+  int num_xstreams;
+  ABT_pool *pools;
+  int num_pools;
+  ABT_thread *threads;
+  int num_threads;
+} parallel_for_context_t;
+
+typedef struct {
+  size_t start_idx;                       /* start index (inclusive) of the operated range */
+  size_t stop_idx;                        /* stop index (exclusive) of the operated range */
+  void (*iteration_func)(void *, size_t); /* provided function to perform on each iteration */
+  void *iter_args;                        /* args to use in each iteration */
+} parallel_for_args_t;
+
+void parallel_for_thread(void *arg) {
+  parallel_for_args_t *parallel_for_args = (parallel_for_args_t *)arg;
+  size_t start_idx = parallel_for_args->start_idx;
+  size_t stop_idx = parallel_for_args->stop_idx;
+
+  for (size_t cur_idx = start_idx; cur_idx < stop_idx; ++cur_idx) {
+      parallel_for_args->iteration_func(parallel_for_args->iter_args, cur_idx);
+  }
+}
+
+void ABT_parallel_for(
+  parallel_for_context_t *parallel_for_context,
+  size_t start_idx,
+  size_t stop_idx,
+  void (*iteration_func)(void *, size_t),
+  void *iter_args
+) {
+  int num_threads = parallel_for_context->num_threads;
+  size_t total_iters = stop_idx - start_idx;
+  size_t iters_per_thread = total_iters / num_threads;
+  parallel_for_args_t *thread_args = 
+      (parallel_for_args_t *)malloc(sizeof(parallel_for_args_t) * num_threads);
+
+  for (int i = 0; i < num_threads; ++i) {
+    size_t local_start_idx = start_idx + i * iters_per_thread;
+    thread_args[i].start_idx = local_start_idx;
+    size_t local_iters = (i == num_threads - 1) ? (total_iters - i * iters_per_thread) : iters_per_thread;
+    thread_args[i].stop_idx = local_start_idx + local_iters;
+    thread_args[i].iteration_func = iteration_func;
+    thread_args[i].iter_args = iter_args;
+  }
+
+  for (int i = 0; i < num_threads; ++i) {
+    int pool_id = i % parallel_for_context->num_xstreams;
+    ABT_thread_create(
+      parallel_for_context->pools[pool_id],
+      parallel_for_thread,
+      &thread_args[i],
+      ABT_THREAD_ATTR_NULL,
+      &(parallel_for_context->threads[i])
+    );
+  }
+
+  for (int i = 0; i < num_threads; ++i) {
+    ABT_thread_join(parallel_for_context->threads[i]);
+  }
+
+  free(thread_args);
+}
+
+//---------------------------------------------------------------------
+/* common / argobots / */
+#define DEFAULT_NUM_XSTREAMS 2
+#define DEFAULT_NUM_THREADS 8
+parallel_for_context_t parallel_for_context;
+
 /* common / main_int_mem / */
 static int colidx[NZ];
 static int rowstr[NA+1];
@@ -58,7 +128,8 @@ static double r[NA+2];
 
 /* common /tinof/ */
 static int myid, num_threads, ilow, ihigh;
-#pragma omp threadprivate(myid, num_threads, ilow, ihigh)
+// Placed here only just as a reminder
+// #pragma omp threadprivate(myid, num_threads, ilow, ihigh)
 
 #define max_threads 1024
 static int last_n[max_threads+1];
@@ -74,12 +145,119 @@ static int lastcol;
 /* common /urando/ */
 static double amult;
 static double tran;
-#pragma omp threadprivate (amult,tran)
+// Placed here only just as a reminder
+// #pragma omp threadprivate (amult,tran)
 
 /* common /timers/ */
 static logical timeron;
 //---------------------------------------------------------------------
+/* argobots fors */
 
+void parallel_for_1_func(void *iter_args, size_t cur_idx) {
+  for (int k = rowstr[cur_idx]; k < rowstr[cur_idx+1]; k++) {
+    colidx[k] = colidx[k] - firstcol;
+  }
+}
+
+void parallel_for_2_func(void *iter_args, size_t cur_idx) {
+  x[cur_idx] = 1.0;
+}
+
+void parallel_for_3_func(void *iter_args, size_t cur_idx) {
+  q[cur_idx] = 0.0;
+  z[cur_idx] = 0.0;
+  r[cur_idx] = 0.0;
+  p[cur_idx] = 0.0;
+}
+
+typedef struct {
+  double norm_temp2;
+} parallel_for_4_args_t;
+
+void parallel_for_4_func(void *iter_args, size_t cur_idx) {
+  parallel_for_4_args_t *args = (parallel_for_4_args_t *)iter_args;
+  double norm_temp2 = args->norm_temp2;
+  x[cur_idx] = norm_temp2 * z[cur_idx];
+}
+
+void parallel_for_5_func(void *iter_args, size_t cur_idx) {
+  x[cur_idx] = 1.0;
+}
+
+typedef struct {
+  double norm_temp2;
+} parallel_for_6_args_t;
+
+void parallel_for_6_func(void *iter_args, size_t cur_idx) {
+  parallel_for_6_args_t *args = (parallel_for_6_args_t *)iter_args;
+  double norm_temp2 = args->norm_temp2;
+  x[cur_idx] = norm_temp2 * z[cur_idx];
+}
+
+void parallel_for_7_func(void *iter_args, size_t cur_idx) {
+  q[cur_idx] = 0.0;
+  z[cur_idx] = 0.0;
+  r[cur_idx] = x[cur_idx];
+  p[cur_idx] = r[cur_idx];
+}
+
+void parallel_for_8_func(void *iter_args, size_t cur_idx) {
+  double sum_local = 0.0;
+  for (int k = rowstr[cur_idx]; k < rowstr[cur_idx+1]; k++) {
+    sum_local = sum_local + a[k]*p[colidx[k]];
+  }
+  q[cur_idx] = sum_local;
+}
+
+typedef struct {
+  double beta;
+} parallel_for_9_args_t;
+
+void parallel_for_9_func(void *iter_args, size_t cur_idx) {
+  parallel_for_9_args_t *args = (parallel_for_9_args_t *)iter_args;
+  double beta = args->beta;
+  p[cur_idx] = r[cur_idx] + beta*p[cur_idx];
+}
+
+void parallel_for_10_func(void *iter_args, size_t cur_idx) {
+  double sum_local = 0.0;
+  for (int k = rowstr[cur_idx]; k < rowstr[cur_idx+1]; k++) {
+    sum_local = sum_local + a[k]*z[colidx[k]];
+  }
+  r[cur_idx] = sum_local;
+}
+
+typedef struct {
+  int *nzloc;
+} parallel_for_11_args_t;
+
+void parallel_for_11_func(void *iter_args, size_t cur_idx) {
+  parallel_for_11_args_t *args = (parallel_for_11_args_t *)iter_args;
+  int *nzloc = args->nzloc;
+  int j1, j2, k, nza;
+  if (cur_idx > 0) {
+    j1 = rowstr[cur_idx] - nzloc[cur_idx-1];
+  } else {
+    j1 = 0;
+  }
+  j2 = rowstr[cur_idx+1] - nzloc[cur_idx];
+  nza = rowstr[cur_idx];
+  for (k = j1; k < j2; k++) {
+    a[k] = v[nza];
+    colidx[k] = iv[nza];
+    nza = nza + 1;
+  }
+}
+
+typedef struct {
+  int *nzloc;
+} parallel_for_12_args_t;
+
+void parallel_for_12_func(void *iter_args, size_t cur_idx) {
+  parallel_for_12_args_t *args = (parallel_for_12_args_t *)iter_args;
+  int *nzloc = args->nzloc;
+  rowstr[cur_idx] = rowstr[cur_idx] - nzloc[cur_idx-1];
+}
 
 //---------------------------------------------------------------------
 static void conj_grad(int colidx[],
@@ -128,11 +306,49 @@ static void vecset(int n, double v[], int iv[], int *nzv, int i, double val);
 //---------------------------------------------------------------------
 
 
+
+
 int main(int argc, char *argv[])
 {
-  int i, j, k, it;
+  // init argobots
+  // TODO: move to global constants or use optget??
+  int num_xstreams = DEFAULT_NUM_XSTREAMS;
+  int num_threads = DEFAULT_NUM_THREADS;
+  int num_pools = num_xstreams;
+
+  /* Allocate memory. */
+  // TODO: maybe we should use stack memory?
+  ABT_xstream *xstreams =
+      (ABT_xstream *)malloc(sizeof(ABT_xstream) * num_xstreams);
+  ABT_pool *pools = (ABT_pool *)malloc(sizeof(ABT_pool) * num_pools);
+  ABT_thread *threads =
+      (ABT_thread *)malloc(sizeof(ABT_thread) * num_threads);
+
+  /* Initialize Argobots. */
   ABT_init(argc, argv);
-  ABT_finalize();
+
+  /* Get a primary execution stream. */
+  ABT_xstream_self(&xstreams[0]);
+
+  /* Create secondary execution streams. */
+  for (int i = 1; i < num_xstreams; i++) {
+      ABT_xstream_create(ABT_SCHED_NULL, &xstreams[i]);
+  }
+
+  /* Get default pools. */
+  for (int i = 0; i < num_xstreams; i++) {
+      ABT_xstream_get_main_pools(xstreams[i], 1, &pools[i]);
+  }
+
+  // setup global parallel_for context
+  parallel_for_context.xstreams = xstreams;
+  parallel_for_context.num_xstreams = num_xstreams;
+  parallel_for_context.pools = pools;
+  parallel_for_context.num_pools = num_pools;
+  parallel_for_context.threads = threads;
+  parallel_for_context.num_threads = num_threads;
+
+  int i, j, k, it;
 
   double zeta;
   double rnorm;
@@ -195,7 +411,8 @@ int main(int argc, char *argv[])
   printf("\n\n NAS Parallel Benchmarks (NPB3.3-OMP-C) - CG Benchmark\n\n");
   printf(" Size: %11d\n", NA);
   printf(" Iterations:                  %5d\n", NITER);
-  printf(" Number of available threads: %5d\n", omp_get_max_threads());
+  printf(" Number of available xstreams: %5d\n", num_xstreams);
+  printf(" Number of available threads:  %5d\n", num_threads);
   printf("\n");
 
   naa = NA;
@@ -204,6 +421,7 @@ int main(int argc, char *argv[])
   //---------------------------------------------------------------------
   // Inialize random number generator
   //---------------------------------------------------------------------
+  // TODO: use argobots
   #pragma omp parallel default(shared) private(i,j,k,zeta)
   {
     tran    = 314159265.0;
@@ -220,6 +438,7 @@ int main(int argc, char *argv[])
           (double (*)[NONZER+1])(void*)aelt,
           v, iv);
 
+    // TODO: use argobots
     #pragma omp barrier
 
     //---------------------------------------------------------------------
@@ -230,27 +449,36 @@ int main(int argc, char *argv[])
     //    Shift the col index vals from actual (firstcol --> lastcol ) 
     //    to local, i.e., (0 --> lastcol-firstcol)
     //---------------------------------------------------------------------
-    #pragma omp for
-    for (j = 0; j < lastrow - firstrow + 1; j++) {
-      for (k = rowstr[j]; k < rowstr[j+1]; k++) {
-        colidx[k] = colidx[k] - firstcol;
-      }
-    }
+
+    ABT_parallel_for(&parallel_for_context, 0, lastrow - firstrow + 1, parallel_for_1_func, NULL);
+    // Equivalent to:
+    // #pragma omp for
+    // for (j = 0; j < lastrow - firstrow + 1; j++) {
+    //   for (k = rowstr[j]; k < rowstr[j+1]; k++) {
+    //     colidx[k] = colidx[k] - firstcol;
+    //   }
+    // }
 
     //---------------------------------------------------------------------
     // set starting vector to (1, 1, .... 1)
     //---------------------------------------------------------------------
-    #pragma omp for
-    for (i = 0; i < NA+1; i++) {
-      x[i] = 1.0;
-    }
-    #pragma omp for
-    for (j = 0; j < lastcol - firstcol + 1; j++) {
-      q[j] = 0.0;
-      z[j] = 0.0;
-      r[j] = 0.0;
-      p[j] = 0.0;
-    }
+    
+    ABT_parallel_for(&parallel_for_context, 0, NA+1, parallel_for_2_func, NULL);
+    // Equivalent to:
+    // #pragma omp for
+    // for (i = 0; i < NA+1; i++) {
+    //   x[i] = 1.0;
+    // }
+
+    ABT_parallel_for(&parallel_for_context, 0, lastcol - firstcol + 1, parallel_for_3_func, NULL);
+    // Equivalent to:
+    // #pragma omp for
+    // for (j = 0; j < lastcol - firstcol + 1; j++) {
+    //   q[j] = 0.0;
+    //   z[j] = 0.0;
+    //   r[j] = 0.0;
+    //   p[j] = 0.0;
+    // }
   }
 
   zeta = 0.0;
@@ -274,6 +502,9 @@ int main(int argc, char *argv[])
     //---------------------------------------------------------------------
     norm_temp1 = 0.0;
     norm_temp2 = 0.0;
+    // TODO: use argobost
+    // Для norm_temp1 существующая редукция не сработает
+    // Для norm_temp2 нужно будет написать функцию для квадрата числа
     #pragma omp parallel for default(shared) private(j) \
                              reduction(+:norm_temp1,norm_temp2)
     for (j = 0; j < lastcol - firstcol + 1; j++) {
@@ -286,20 +517,26 @@ int main(int argc, char *argv[])
     //---------------------------------------------------------------------
     // Normalize z to obtain x
     //---------------------------------------------------------------------
-    #pragma omp parallel for default(shared) private(j)
-    for (j = 0; j < lastcol - firstcol + 1; j++) {     
-      x[j] = norm_temp2 * z[j];
-    }
+    parallel_for_4_args_t parallel_for_4_args = {.norm_temp2 = norm_temp2};
+    ABT_parallel_for(&parallel_for_context, 0, lastcol - firstcol + 1, parallel_for_4_func, &parallel_for_4_args);
+    // Equivalent to:
+    // #pragma omp parallel for default(shared) private(j)
+    // for (j = 0; j < lastcol - firstcol + 1; j++) {     
+    //   x[j] = norm_temp2 * z[j];
+    // }
   } // end of do one iteration untimed
 
 
   //---------------------------------------------------------------------
   // set starting vector to (1, 1, .... 1)
   //---------------------------------------------------------------------
-  #pragma omp parallel for default(shared) private(i)
-  for (i = 0; i < NA+1; i++) {
-    x[i] = 1.0;
-  }
+
+  ABT_parallel_for(&parallel_for_context, 0, NA+1, parallel_for_5_func, NULL);
+  // Equivalent to:
+  // #pragma omp parallel for default(shared) private(i)
+  // for (i = 0; i < NA+1; i++) {
+  //   x[i] = 1.0;
+  // }
 
   zeta = 0.0;
 
@@ -330,6 +567,9 @@ int main(int argc, char *argv[])
     //---------------------------------------------------------------------
     norm_temp1 = 0.0;
     norm_temp2 = 0.0;
+    // TODO: use argobost
+    // Для norm_temp1 существующая редукция не сработает
+    // Для norm_temp2 нужно будет написать функцию для квадрата числа
     #pragma omp parallel for default(shared) private(j) \
                              reduction(+:norm_temp1,norm_temp2)
     for (j = 0; j < lastcol - firstcol + 1; j++) {
@@ -347,10 +587,13 @@ int main(int argc, char *argv[])
     //---------------------------------------------------------------------
     // Normalize z to obtain x
     //---------------------------------------------------------------------
-    #pragma omp parallel for default(shared) private(j)
-    for (j = 0; j < lastcol - firstcol + 1; j++) {
-      x[j] = norm_temp2 * z[j];
-    }
+    parallel_for_6_args_t parallel_for_6_args = {.norm_temp2 = norm_temp2};
+    ABT_parallel_for(&parallel_for_context, 0, lastcol - firstcol + 1, parallel_for_6_func, &parallel_for_6_args);
+    // Equivalent to:
+    // #pragma omp parallel for default(shared) private(j)
+    // for (j = 0; j < lastcol - firstcol + 1; j++) {
+    //   x[j] = norm_temp2 * z[j];
+    // }
   } // end of main iter inv pow meth
 
   timer_stop(T_bench);
@@ -419,6 +662,14 @@ int main(int argc, char *argv[])
     }
   }
 
+  /* Finalize Argobots. */
+  ABT_finalize();
+
+  /* Free allocated memory. */
+  free(xstreams);
+  free(pools);
+  free(threads);
+
   return 0;
 }
 
@@ -444,24 +695,29 @@ static void conj_grad(int colidx[],
   rho = 0.0;
   sum = 0.0;
 
+  // TODO: use argobost
   #pragma omp parallel default(shared) private(j,k,cgit,suml,alpha,beta) \
                                        shared(d,rho0,rho,sum)
   {
   //---------------------------------------------------------------------
   // Initialize the CG algorithm:
   //---------------------------------------------------------------------
-  #pragma omp for
-  for (j = 0; j < naa+1; j++) {
-    q[j] = 0.0;
-    z[j] = 0.0;
-    r[j] = x[j];
-    p[j] = r[j];
-  }
+  ABT_parallel_for(&parallel_for_context, 0, naa+1, parallel_for_7_func, NULL);
+  // Equivalent to:
+  // #pragma omp for
+  // for (j = 0; j < naa+1; j++) {
+  //   q[j] = 0.0;
+  //   z[j] = 0.0;
+  //   r[j] = x[j];
+  //   p[j] = r[j];
+  // }
 
   //---------------------------------------------------------------------
   // rho = r.r
   // Now, obtain the norm of r: First, sum squares of r elements locally...
   //---------------------------------------------------------------------
+  // TODO: use argobost reduction
+  // Для rho нужно будет написать функцию для квадрата числа
   #pragma omp for reduction(+:rho)
   for (j = 0; j < lastcol - firstcol + 1; j++) {
     rho = rho + r[j]*r[j];
@@ -473,6 +729,7 @@ static void conj_grad(int colidx[],
   //---->
   //---------------------------------------------------------------------
   for (cgit = 1; cgit <= cgitmax; cgit++) {
+    // TODO: use argobost
     #pragma omp master
     {
       //---------------------------------------------------------------------
@@ -482,6 +739,7 @@ static void conj_grad(int colidx[],
       d = 0.0;
       rho = 0.0;
     }
+    // TODO: use argobost
     #pragma omp barrier
 
     //---------------------------------------------------------------------
@@ -496,14 +754,16 @@ static void conj_grad(int colidx[],
     //       The unrolled-by-8 version below is significantly faster
     //       on the Cray t3d - overall speed of code is 1.5 times faster.
 
-    #pragma omp for
-    for (j = 0; j < lastrow - firstrow + 1; j++) {
-      suml = 0.0;
-      for (k = rowstr[j]; k < rowstr[j+1]; k++) {
-        suml = suml + a[k]*p[colidx[k]];
-      }
-      q[j] = suml;
-    }
+    ABT_parallel_for(&parallel_for_context, 0, lastrow - firstrow + 1, parallel_for_8_func, NULL);
+    // Equivalent to:
+    // #pragma omp for
+    // for (j = 0; j < lastrow - firstrow + 1; j++) {
+    //   suml = 0.0;
+    //   for (k = rowstr[j]; k < rowstr[j+1]; k++) {
+    //     suml = suml + a[k]*p[colidx[k]];
+    //   }
+    //   q[j] = suml;
+    // }
 
     /*
     for (j = 0; j < lastrow - firstrow + 1; j++) {
@@ -546,6 +806,9 @@ static void conj_grad(int colidx[],
     //---------------------------------------------------------------------
     // Obtain p.q
     //---------------------------------------------------------------------
+    // TODO: use argobost reduction
+    // Редукция по двум массивам. Текущая реализация нуждается в доработках
+    // Как вариант обхода - сделать временный массив с произведениям и над ним произвести редукцию
     #pragma omp for reduction(+:d)
     for (j = 0; j < lastcol - firstcol + 1; j++) {
       d = d + p[j]*q[j];
@@ -560,6 +823,9 @@ static void conj_grad(int colidx[],
     // Obtain z = z + alpha*p
     // and    r = r - alpha*q
     //---------------------------------------------------------------------
+    // TODO: use argobost
+    // Разбить на for
+    // + редукция r с использованием функции возведения в квадрат
     #pragma omp for reduction(+:rho)
     for (j = 0; j < lastcol - firstcol + 1; j++) {
       z[j] = z[j] + alpha*p[j];
@@ -580,10 +846,13 @@ static void conj_grad(int colidx[],
     //---------------------------------------------------------------------
     // p = r + beta*p
     //---------------------------------------------------------------------
-    #pragma omp for
-    for (j = 0; j < lastcol - firstcol + 1; j++) {
-      p[j] = r[j] + beta*p[j];
-    }
+    parallel_for_9_args_t parallel_for_9_args = {.beta = beta};
+    ABT_parallel_for(&parallel_for_context, 0, lastcol - firstcol + 1, parallel_for_9_func, &parallel_for_9_args);
+    // Equivalent to:
+    // #pragma omp for
+    // for (j = 0; j < lastcol - firstcol + 1; j++) {
+    //   p[j] = r[j] + beta*p[j];
+    // }
   } // end of do cgit=1,cgitmax
 
   //---------------------------------------------------------------------
@@ -591,18 +860,22 @@ static void conj_grad(int colidx[],
   // First, form A.z
   // The partition submatrix-vector multiply
   //---------------------------------------------------------------------
-  #pragma omp for
-  for (j = 0; j < lastrow - firstrow + 1; j++) {
-    suml = 0.0;
-    for (k = rowstr[j]; k < rowstr[j+1]; k++) {
-      suml = suml + a[k]*z[colidx[k]];
-    }
-    r[j] = suml;
-  }
+  ABT_parallel_for(&parallel_for_context, 0, lastrow - firstrow + 1, parallel_for_10_func, NULL);
+  // Equivalent to:
+  // #pragma omp for
+  // for (j = 0; j < lastrow - firstrow + 1; j++) {
+  //   suml = 0.0;
+  //   for (k = rowstr[j]; k < rowstr[j+1]; k++) {
+  //     suml = suml + a[k]*z[colidx[k]];
+  //   }
+  //   r[j] = suml;
+  // }
 
   //---------------------------------------------------------------------
   // At this point, r contains A.z
   //---------------------------------------------------------------------
+  // TODO: use argobost
+  // Снова редукция редукция для двух массивов
   #pragma omp for reduction(+:sum) nowait
   for (j = 0; j < lastcol-firstcol+1; j++) {
     suml = x[j] - r[j];
@@ -674,8 +947,12 @@ static void makea(int n,
   //---------------------------------------------------------------------
   // Generate nonzero positions and save for the use in sparse.
   //---------------------------------------------------------------------
-  num_threads = omp_get_num_threads();
-  myid = omp_get_thread_num();
+  // TODO: use argobost values
+  num_threads = 2;
+  // num_threads = omp_get_num_threads();
+  // TODO: use argobost values
+  myid = 0;
+  // myid = omp_get_thread_num();
   if (num_threads > max_threads) {
     if (myid == 0) {
       printf(" Warning: num_threads%6d exceeded an internal limit%6d\n",
@@ -701,6 +978,7 @@ static void makea(int n,
     }
   }
 
+  // TODO: use argobost
   #pragma omp barrier
 
   //---------------------------------------------------------------------
@@ -777,6 +1055,7 @@ static void sparse(double a[],
     rowstr[j] = rowstr[j] + rowstr[j-1];
   }
   if (myid < num_threads) last_n[myid] = rowstr[j2-1];
+  // TODO: use argobost
   #pragma omp barrier
 
   nzrow = 0;
@@ -790,6 +1069,7 @@ static void sparse(double a[],
       rowstr[j] = rowstr[j] + nzrow;
     }
   }
+  // TODO: use argobost
   #pragma omp barrier
 
   nza = rowstr[nrows] - 1;
@@ -799,6 +1079,7 @@ static void sparse(double a[],
   //     of row j of a
   //---------------------------------------------------------------------
   if (nza > nz) {
+    // TODO: use argobost
     #pragma omp master
     {
       printf("Space for matrix elements exceeded in sparse\n");
@@ -881,6 +1162,7 @@ static void sparse(double a[],
     }
     size = size * ratio;
   }
+  // TODO: use argobost
   #pragma omp barrier
 
   //---------------------------------------------------------------------
@@ -890,6 +1172,7 @@ static void sparse(double a[],
     nzloc[j] = nzloc[j] + nzloc[j-1];
   }
   if (myid < num_threads) last_n[myid] = nzloc[ihigh-1];
+  // TODO: use argobost
   #pragma omp barrier
 
   nzrow = 0;
@@ -903,27 +1186,34 @@ static void sparse(double a[],
       nzloc[j] = nzloc[j] + nzrow;
     }
   }
+  // TODO: use argobost
   #pragma omp barrier
 
-  #pragma omp for
-  for (j = 0; j < nrows; j++) {
-    if (j > 0) {
-      j1 = rowstr[j] - nzloc[j-1];
-    } else {
-      j1 = 0;
-    }
-    j2 = rowstr[j+1] - nzloc[j];
-    nza = rowstr[j];
-    for (k = j1; k < j2; k++) {
-      a[k] = v[nza];
-      colidx[k] = iv[nza];
-      nza = nza + 1;
-    }
-  }
-  #pragma omp for
-  for (j = 1; j < nrows+1; j++) {
-    rowstr[j] = rowstr[j] - nzloc[j-1];
-  }
+  parallel_for_11_args_t parallel_for_11_args = {.nzloc = nzloc};
+  ABT_parallel_for(&parallel_for_context, 0, nrows, parallel_for_11_func, &parallel_for_11_args);
+  // Equivalent to:
+  // #pragma omp for
+  // for (j = 0; j < nrows; j++) {
+  //   if (j > 0) {
+  //     j1 = rowstr[j] - nzloc[j-1];
+  //   } else {
+  //     j1 = 0;
+  //   }
+  //   j2 = rowstr[j+1] - nzloc[j];
+  //   nza = rowstr[j];
+  //   for (k = j1; k < j2; k++) {
+  //     a[k] = v[nza];
+  //     colidx[k] = iv[nza];
+  //     nza = nza + 1;
+  //   }
+  // }
+  parallel_for_12_args_t parallel_for_12_args = {.nzloc = nzloc};
+  ABT_parallel_for(&parallel_for_context, 1, nrows+1, parallel_for_12_func, &parallel_for_12_args);
+  // Equivalent to:
+  // #pragma omp for
+  // for (j = 1; j < nrows+1; j++) {
+  //   rowstr[j] = rowstr[j] - nzloc[j-1];
+  // }
   nza = rowstr[nrows] - 1;
 }
 
